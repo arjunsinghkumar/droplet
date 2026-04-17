@@ -14,7 +14,6 @@ RAW_FILE = Path(__file__).parent.parent / "data" / "raw" / "ganglion_test_drive.
 PROCESSED_DIR = Path(__file__).parent.parent / "data" / "processed"
 PLOT_DIR = Path(__file__).parent.parent / "output" / "plots"
 
-SFREQ = 250  # Hz
 EXG_CHANNELS = ["EXG_CH0", "EXG_CH1", "EXG_CH2", "EXG_CH3"]
 ACCEL_CHANNELS = ["Accel_X", "Accel_Y", "Accel_Z"]
 
@@ -27,15 +26,22 @@ EEG_BANDS = {
 }
 
 
-def load_raw_data(filepath: Path) -> pd.DataFrame:
-    header_lines = 0
+def parse_header(filepath: Path) -> dict:
+    meta = {}
     with open(filepath) as f:
         for line in f:
-            if line.startswith("%"):
-                header_lines += 1
-            else:
+            if not line.startswith("%"):
                 break
+            if "Sample Rate" in line:
+                meta["sfreq"] = int(line.split("=")[1].strip().split()[0])
+            if "Number of channels" in line:
+                meta["n_channels"] = int(line.split("=")[1].strip())
+            if "Board" in line:
+                meta["board"] = line.split("=")[1].strip()
+    return meta
 
+
+def load_raw_data(filepath: Path, sfreq: int) -> pd.DataFrame:
     col_line = None
     with open(filepath) as f:
         for i, line in enumerate(f):
@@ -60,36 +66,41 @@ def load_raw_data(filepath: Path) -> pd.DataFrame:
     keep_cols = [c for c in keep_cols if c in df.columns]
     df = df[keep_cols]
 
-    df["time_s"] = np.arange(len(df)) / SFREQ
+    df["time_s"] = np.arange(len(df)) / sfreq
 
-    print(f"Loaded {len(df)} samples ({len(df)/SFREQ:.1f}s) at {SFREQ} Hz")
+    print(f"Loaded {len(df)} samples ({len(df)/sfreq:.1f}s) at {sfreq} Hz")
+    print(f"  Time range: {df['timestamp'].iloc[0]} → {df['timestamp'].iloc[-1]}")
     return df
 
 
-def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
+def apply_filters(df: pd.DataFrame, sfreq: int) -> pd.DataFrame:
     filtered = df.copy()
 
-    # Bandpass 0.5-100 Hz
-    sos_bp = signal.butter(4, [0.5, 100], btype="bandpass", fs=SFREQ, output="sos")
-    # Notch at 50 Hz and 60 Hz (cover both power line frequencies)
-    b_50, a_50 = signal.iirnotch(50, 30, SFREQ)
-    b_60, a_60 = signal.iirnotch(60, 30, SFREQ)
+    nyquist = sfreq / 2.0
+    hp_freq = min(nyquist - 1, 90)
+    sos_bp = signal.butter(4, [0.5, hp_freq], btype="bandpass", fs=sfreq, output="sos")
+
+    notch_filters = []
+    for fnotch in [50, 60]:
+        if fnotch < nyquist:
+            b, a = signal.iirnotch(fnotch, 30, sfreq)
+            notch_filters.append((b, a))
 
     for ch in EXG_CHANNELS:
         x = filtered[ch].values.astype(float)
         x = signal.sosfiltfilt(sos_bp, x)
-        x = signal.filtfilt(b_50, a_50, x)
-        x = signal.filtfilt(b_60, a_60, x)
+        for b, a in notch_filters:
+            x = signal.filtfilt(b, a, x)
         filtered[ch] = x
 
-    print("Applied bandpass (0.5-100 Hz) and notch (50/60 Hz) filters")
+    print(f"Applied bandpass (0.5-{hp_freq:.0f} Hz) and notch (50/60 Hz) filters")
     return filtered
 
 
-def compute_psd(df: pd.DataFrame) -> dict:
+def compute_psd(df: pd.DataFrame, sfreq: int) -> dict:
     psd_results = {}
     for ch in EXG_CHANNELS:
-        freqs, pxx = signal.welch(df[ch].values, fs=SFREQ, nperseg=min(256, len(df)))
+        freqs, pxx = signal.welch(df[ch].values, fs=sfreq, nperseg=min(256, len(df)))
         psd_results[ch] = (freqs, pxx)
     return psd_results
 
@@ -230,15 +241,17 @@ def plot_accelerometer(df: pd.DataFrame, output_dir: Path):
     plt.close()
 
 
-def plot_spectrogram(df: pd.DataFrame, output_dir: Path):
+def plot_spectrogram(df: pd.DataFrame, sfreq: int, output_dir: Path):
     fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
     fig.suptitle("Spectrogram (Time-Frequency)", fontsize=14)
 
     for i, ch in enumerate(EXG_CHANNELS):
-        f, t, Sxx = signal.spectrogram(df[ch].values, fs=SFREQ, nperseg=128, noverlap=96)
+        nperseg = min(128, len(df[ch]) // 4)
+        noverlap = int(nperseg * 0.75)
+        f, t, Sxx = signal.spectrogram(df[ch].values, fs=sfreq, nperseg=nperseg, noverlap=noverlap)
         axes[i].pcolormesh(t, f, 10 * np.log10(Sxx + 1e-20), shading="gouraud", cmap="viridis")
         axes[i].set_ylabel(f"{ch}\nFreq (Hz)")
-        axes[i].set_ylim(0, 60)
+        axes[i].set_ylim(0, min(60, sfreq / 2))
 
     axes[-1].set_xlabel("Time (s)")
     plt.tight_layout()
@@ -246,9 +259,9 @@ def plot_spectrogram(df: pd.DataFrame, output_dir: Path):
     plt.close()
 
 
-def create_mne_raw(df: pd.DataFrame) -> mne.io.RawArray:
+def create_mne_raw(df: pd.DataFrame, sfreq: int) -> mne.io.RawArray:
     data = df[EXG_CHANNELS].values.T * 1e-6  # µV -> V for MNE
-    info = mne.create_info(ch_names=EXG_CHANNELS, sfreq=SFREQ, ch_types="eeg")
+    info = mne.create_info(ch_names=EXG_CHANNELS, sfreq=sfreq, ch_types="eeg")
     raw = mne.io.RawArray(data, info, verbose=False)
     return raw
 
@@ -261,32 +274,32 @@ def main():
     print("OpenBCI Ganglion EEG Data Processing Pipeline")
     print("=" * 60)
 
-    # 1. Load raw data
-    print("\n[1/7] Loading raw data...")
-    df_raw = load_raw_data(RAW_FILE)
+    meta = parse_header(RAW_FILE)
+    sfreq = meta.get("sfreq", 200)
+    board = meta.get("board", "unknown")
+    print(f"\nBoard: {board}")
+    print(f"Sample rate: {sfreq} Hz")
 
-    # 2. Compute raw statistics
+    print("\n[1/7] Loading raw data...")
+    df_raw = load_raw_data(RAW_FILE, sfreq)
+
     print("\n[2/7] Computing raw signal statistics...")
     raw_stats = compute_statistics(df_raw)
     print(raw_stats.to_string(index=False))
 
-    # 3. Plot raw signals
     print("\n[3/7] Plotting raw signals...")
     plot_raw_signals(df_raw, PLOT_DIR)
     plot_accelerometer(df_raw, PLOT_DIR)
 
-    # 4. Apply filters
     print("\n[4/7] Filtering signals...")
-    df_filtered = apply_filters(df_raw)
+    df_filtered = apply_filters(df_raw, sfreq)
 
-    # 5. Plot filtered signals + spectrogram
     print("\n[5/7] Plotting filtered signals and spectrogram...")
     plot_filtered_signals(df_filtered, PLOT_DIR)
-    plot_spectrogram(df_filtered, PLOT_DIR)
+    plot_spectrogram(df_filtered, sfreq, PLOT_DIR)
 
-    # 6. Spectral analysis
     print("\n[6/7] Computing spectral analysis...")
-    psd_results = compute_psd(df_filtered)
+    psd_results = compute_psd(df_filtered, sfreq)
     plot_psd(psd_results, PLOT_DIR)
 
     band_powers = compute_band_powers(psd_results)
@@ -296,25 +309,23 @@ def main():
     rel_cols = ["channel"] + [f"{b}_rel" for b in EEG_BANDS]
     print(band_powers[rel_cols].to_string(index=False))
 
-    # 7. Save processed data
     print("\n[7/7] Saving processed data...")
     df_filtered.to_csv(PROCESSED_DIR / "filtered_eeg.csv", index=False)
     band_powers.to_csv(PROCESSED_DIR / "band_powers.csv", index=False)
     raw_stats.to_csv(PROCESSED_DIR / "signal_statistics.csv", index=False)
 
-    # Also save as MNE-compatible FIF
-    raw_mne = create_mne_raw(df_filtered)
+    raw_mne = create_mne_raw(df_filtered, sfreq)
     raw_mne.save(PROCESSED_DIR / "ganglion_eeg_raw.fif", overwrite=True, verbose=False)
 
     print(f"\nProcessed data saved to: {PROCESSED_DIR}")
     print(f"Plots saved to: {PLOT_DIR}")
 
-    # Summary
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"  Recording duration: {len(df_raw)/SFREQ:.1f} seconds")
-    print(f"  Sample rate: {SFREQ} Hz")
+    print(f"  Board: {board}")
+    print(f"  Recording duration: {len(df_raw)/sfreq:.1f} seconds")
+    print(f"  Sample rate: {sfreq} Hz")
     print(f"  Total samples: {len(df_raw)}")
     print(f"  Channels: {len(EXG_CHANNELS)} EXG + {len(ACCEL_CHANNELS)} Accel")
     print(f"  Time range: {df_raw['timestamp'].iloc[0]} → {df_raw['timestamp'].iloc[-1]}")
